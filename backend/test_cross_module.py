@@ -630,5 +630,127 @@ def test_cross_module_auto_flow():
     assert (DATA_ROOT / "checkpoints").exists()
 
 
+# ---------------------------------------------------------------------------
+# 回溯质量报告：独立输入、源+任务绑定、失败重试幂等、异常证据回查
+# ---------------------------------------------------------------------------
+
+def _backfill_fixture(source_key: str = "LOG_-0003"):
+    svc = BackfillRangeService()
+    task = svc.create_backfill(source_key, "2026-09-01~2026-09-30")
+    task_id = task["任务编号"]
+    svc.execute_backfill(task_id, batch_size=6)
+    return svc, LogQualityService(), task_id
+
+
+def test_backfill_quality_uses_only_task_detail():
+    """只有回溯文件时也能出报告，且行数来自本任务实际采得的明细。"""
+    svc, quality, task_id = _backfill_fixture()
+    result = svc.complete_backfill(task_id)
+    report = result["auto_quality"]
+
+    assert report["report_status"] == "已确认"
+    assert report["task_id"] == task_id
+    assert report["source_key"] == "LOG_-0003"
+    assert report["valid_raw_lines"] == 6
+    assert report["bad_lines"] == 0
+    assert report["total_records"] == 6
+    assert report["diagnosis_input"]["online_records_used"] == 0
+    assert report["diagnosis_input"]["other_tasks_used"] == 0
+    # 报告详情可回查
+    assert quality.get_backfill_quality_report(task_id)["batch_key"] == report["batch_key"]
+
+
+def test_backfill_quality_isolated_from_online_and_other_task():
+    """同源两个时间段：在线采集与另一个任务都不计入本次报告。"""
+    svc, quality, task1 = _backfill_fixture()
+    sources = LogSourceService().get_active_sources()
+    LogSourceService().collect_from_source(sources[0]["id"], batch_size=6)
+
+    task2 = svc.create_backfill("LOG_-0003", "2026-10-01~2026-10-31")["任务编号"]
+    svc.execute_backfill(task2, batch_size=4)
+
+    report1 = svc.complete_backfill(task1)["auto_quality"]
+    report2 = svc.complete_backfill(task2)["auto_quality"]
+
+    assert report1["valid_raw_lines"] == 6
+    assert report2["valid_raw_lines"] == 4
+    assert report1["time_range"] == "2026-09-01~2026-09-30"
+    assert report2["time_range"] == "2026-10-01~2026-10-31"
+    assert report1["batch_key"] != report2["batch_key"]
+    assert report2["range_proof"]["timestamp_min"].startswith("2026-10-01")
+
+
+def test_backfill_quality_counts_bad_lines_and_keeps_evidence():
+    """坏行按实际明细计入异常，异常证据仍可回查。"""
+    svc, quality, task_id = _backfill_fixture()
+    detail = svc._task_detail_path("LOG_-0003", task_id)
+    rows = quality._read_jsonl(detail)
+    rows.append({**rows[0]})                       # 重复 record_id
+    rows.append({**rows[1], "raw": "损坏的原始行"})  # 格式不符
+    quality._atomic_write_jsonl(detail, rows)
+
+    report = svc.complete_backfill(task_id)["auto_quality"]
+    assert report["valid_raw_lines"] == 6
+    assert report["bad_lines"] == 2
+    assert report["abnormal_categories"]["duplicate_record"] == 1
+    assert report["abnormal_categories"]["format_mismatch"] == 1
+    assert 0 < report["parse_success_rate"] < 100
+
+    evidence = quality.get_backfill_anomalies(task_id)
+    assert {item["category"] for item in evidence} == {"duplicate_record", "format_mismatch"}
+    assert all(item["source_key"] == "LOG_-0003" for item in evidence)
+
+
+def test_backfill_quality_write_failure_and_idempotent_retry(monkeypatch):
+    """写入中断时说明原因；重试只生成一份确认报告，历史证据保留。"""
+    svc, quality, task_id = _backfill_fixture()
+    detail = svc._task_detail_path("LOG_-0003", task_id)
+    rows = quality._read_jsonl(detail)
+    quality._atomic_write_jsonl(detail, rows + [{**rows[0], "raw": "坏行"}])
+
+    original = LogQualityService._atomic_write_json
+
+    def flaky(self, path, payload):
+        if str(path).endswith(f"backfill_quality_{task_id}.json"):
+            raise OSError("simulated interruption")
+        return original(self, path, payload)
+
+    monkeypatch.setattr(LogQualityService, "_atomic_write_json", flaky)
+    failed = svc.complete_backfill(task_id)
+    monkeypatch.undo()
+
+    assert failed["quality_error"]["report_status"] == "失败"
+    assert "simulated interruption" in failed["quality_error"]["error"]
+    assert failed["quality_error"]["valid_raw_lines"] == 6
+    assert quality.get_backfill_quality_report(task_id) is None
+    assert quality.get_backfill_report_failure(task_id)["error"]
+    # 失败时异常证据已经落盘，仍可回查
+    assert quality.get_backfill_anomalies(task_id)
+
+    retried = svc.complete_backfill(task_id)
+    assert retried["auto_quality"]["valid_raw_lines"] == 6
+    assert retried["auto_quality"]["bad_lines"] == 1
+
+    # 再重试一次：复用同批确认报告，不新增
+    again = svc.complete_backfill(task_id)
+    assert again["auto_quality"].get("reused") is True
+
+    summary = quality._read_jsonl(
+        quality._data_dir("exports") / "backfill_quality_reports.jsonl")
+    assert sum(1 for row in summary if row["task_id"] == task_id) == 1
+    assert len(svc.get_backfill_history(task_id=task_id)) == 1
+    assert quality.get_backfill_anomalies(task_id)
+
+
+def test_backfill_quality_fails_without_detail():
+    """没有实际明细时明确说明原因，不生成空报告。"""
+    svc = BackfillRangeService()
+    task_id = svc.create_backfill("LOG_-0003", "2026-11-01~2026-11-30")["任务编号"]
+    failure = LogQualityService().diagnose_backfill_quality(task_id)
+    assert failure["report_status"] == "失败"
+    assert "无实际采集明细" in failure["error"]
+    assert LogQualityService().get_backfill_quality_report(task_id) is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "--tb=short", "-s"]))

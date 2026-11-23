@@ -4,13 +4,64 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import re
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.store import store
 
 DATA_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "data"
+
+_TIME_RANGE_SPLIT = re.compile(r"\s*(?:~|～|至|—|–|--|,|，)\s*")
+_DATE_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%Y%m%d",
+)
+
+
+def parse_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_time_bounds(time_range: str) -> tuple[datetime, datetime] | None:
+    """把 ``2026-09-01~2026-09-30`` 之类的时间范围解析为闭区间。"""
+    text = str(time_range or "").strip()
+    if not text:
+        return None
+    parts = [part for part in _TIME_RANGE_SPLIT.split(text) if part.strip()]
+    if len(parts) == 1:
+        start = parse_datetime(parts[0])
+        if start is None:
+            return None
+        return start, start.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if len(parts) >= 2:
+        start = parse_datetime(parts[0])
+        end = parse_datetime(parts[1])
+        if start is None or end is None:
+            return None
+        if len(parts[1].strip()) <= 10:
+            end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+        if end < start:
+            start, end = end, start
+        return start, end
+    return None
 
 
 def _ensure_dir(path: Path) -> None:
@@ -109,7 +160,14 @@ class BaseModuleService:
     def _write_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
         _ensure_dir(filepath.parent)
         written = 0
-        with open(filepath, "a", encoding="utf-8") as f:
+        with open(filepath, "a+", encoding="utf-8") as f:
+            # a+ 直接追加；若上次写入被中断留下没有换行的半行，先补换行，
+            # 避免把新记录粘在坏行末尾。
+            if filepath.stat().st_size > 0:
+                f.seek(0, os.SEEK_END)
+                f.seek(f.tell() - 1)
+                if f.read(1) != "\n":
+                    f.write("\n")
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
                 written += 1
@@ -129,20 +187,61 @@ class BaseModuleService:
                         continue
         return records
 
+    def _atomic_write_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """整体覆盖写入 JSONL：先写临时文件再原子替换，避免中断留下半份内容。
+
+        临时文件的写入复用 ``_write_jsonl``，这样外部替换写实现（或注入写入失败）
+        时，报告写入路径也会一并生效。
+        """
+        _ensure_dir(filepath.parent)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(filepath.parent), prefix=f".{filepath.name}.", suffix=".tmp")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        try:
+            written = self._write_jsonl(tmp_path, records)
+            os.replace(tmp_name, filepath)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        return written
+
+    def _atomic_write_json(self, filepath: Path, payload: Any) -> Path:
+        """整体覆盖写入 JSON：临时文件 + 原子替换，中断时保留旧版本。"""
+        _ensure_dir(filepath.parent)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(filepath.parent), prefix=f".{filepath.name}.", suffix=".tmp")
+        os.close(fd)
+        try:
+            self._write_jsonl(Path(tmp_name), [payload])
+            os.replace(tmp_name, filepath)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        return filepath
+
     def _write_checkpoint(self, name: str, state: dict[str, Any]) -> Path:
         p = self._data_dir("checkpoints")
         cp_file = p / f"{name}.json"
         state["_updated_at"] = time.time()
-        with open(cp_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2, default=str)
-        return cp_file
+        return self._atomic_write_json(cp_file, state)
 
     def _read_checkpoint(self, name: str) -> dict[str, Any] | None:
         cp_file = self._data_dir("checkpoints") / f"{name}.json"
         if not cp_file.exists():
             return None
-        with open(cp_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(cp_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def _compute_checksum(self, content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
@@ -258,12 +357,27 @@ class BaseModuleService:
             return {"auto_trigger": "export", "source_key": source_key, "error": str(e)}
 
     def _trigger_quality_diagnosis(self, source_key: str) -> dict[str, Any]:
-        """自动触发质量诊断。"""
+        """自动触发质量诊断（在线采集数据）。"""
         try:
             cls = self._safe_import("app.services.log_quality", "LogQualityService")
             return cls().diagnose_source(source_key)
         except Exception as e:
             return {"auto_trigger": "quality", "source_key": source_key, "error": str(e)}
+
+    def _trigger_backfill_quality_diagnosis(
+        self, task_id: str, source_key: str | None = None
+    ) -> dict[str, Any]:
+        """自动触发回溯质量诊断：只读取该回溯任务实际保存的采集明细。"""
+        try:
+            cls = self._safe_import("app.services.log_quality", "LogQualityService")
+            return cls().diagnose_backfill_quality(task_id, source_key=source_key)
+        except Exception as e:
+            return {
+                "auto_trigger": "backfill_quality",
+                "task_id": task_id,
+                "source_key": source_key or "",
+                "error": str(e),
+            }
 
     def _trigger_alert_evaluation(self, source_key: str, metrics: dict[str, Any] | None = None) -> dict[str, Any]:
         """自动触发告警评估。"""

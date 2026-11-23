@@ -119,6 +119,40 @@ def run_backfill_pipeline(source_key: str, time_range: str = Query(default="2026
     return pipeline.backfill_pipeline(source_key, time_range)
 
 
+# -- 回溯质量报告详情与异常证据（必须注册在 /{module}/{entry_id} 之前） --
+
+def _quality_service():
+    from app.services.log_quality import LogQualityService
+    return LogQualityService()
+
+
+@router.get("/backfill_range/{task_id}/quality-report")
+def get_backfill_quality_report(task_id: str) -> dict[str, Any]:
+    """回溯质量报告详情：按源 + 任务绑定，返回实际采得的行数、坏行与范围证明。"""
+    service = _quality_service()
+    report = service.get_backfill_report_detail(task_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"回溯任务 {task_id} 尚无已确认的质量报告")
+    return report
+
+@router.get("/backfill_range/{task_id}/quality-anomalies")
+def get_backfill_quality_anomalies(task_id: str) -> dict[str, Any]:
+    """历史异常证据回查：返回该任务保留的坏行/异常明细。"""
+    service = _quality_service()
+    anomalies = service.get_backfill_anomalies(task_id)
+    return {"task_id": task_id, "total": len(anomalies), "items": anomalies}
+
+
+@router.get("/log_quality/backfill/{task_id}")
+def get_backfill_report_entry(task_id: str) -> dict[str, Any]:
+    """从质量诊断模块侧读取回溯报告详情。"""
+    service = _quality_service()
+    report = service.get_backfill_report_detail(task_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"回溯任务 {task_id} 尚无已确认的质量报告")
+    return report
+
+
 @router.post("/pipelines/quality-alert/{source_key}")
 def run_quality_alert_pipeline(source_key: str) -> dict[str, Any]:
     """执行质量诊断+告警管道：诊断 -> 评估 -> 触发告警 -> 位点回滚。"""

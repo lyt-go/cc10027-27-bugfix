@@ -138,21 +138,27 @@ class CrossModulePipeline:
             result = self.backfill_range.execute_backfill(task_id, batch_size=20)
             total_written += result.get("written", 0)
 
-        # 完成回溯
+        # 完成回溯（写入历史日志，并生成任务独立的回溯质量报告）
         complete_r = self.backfill_range.complete_backfill(task_id)
 
         # 更新位点
         cp_state = self.collect_checkpoint.get_checkpoint_state(source_key)
 
-        return {
+        result = {
             "pipeline": "backfill",
             "task_id": task_id,
             "source_key": source_key,
             "time_range": time_range,
             "total_written": total_written,
             "checkpoint": cp_state,
+            "completion": complete_r,
             "duration": round(time.time() - started_at, 2),
         }
+        if "auto_quality" in complete_r:
+            result["auto_quality"] = complete_r["auto_quality"]
+        if "quality_error" in complete_r:
+            result["quality_error"] = complete_r["quality_error"]
+        return result
 
     def quality_alert_pipeline(self, source_key: str) -> dict[str, Any]:
         """质量诊断+告警管道：诊断 -> 评估 -> 触发告警 -> 位点回滚。"""
